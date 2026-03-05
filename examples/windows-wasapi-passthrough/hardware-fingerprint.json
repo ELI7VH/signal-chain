@@ -1,0 +1,131 @@
+{
+  "generated": "2026-03-04",
+  "machine": "DESKTOP-NLGSHV0",
+  "platform": "windows-x86_64",
+  "os": "Windows 10/11",
+  "cpu": {
+    "name": "Intel Core i7-8550U",
+    "cores": 4,
+    "threads": 8,
+    "base_clock_mhz": 1800,
+    "turbo_clock_mhz": 1992,
+    "architecture": "Kaby Lake Refresh",
+    "notes": "Mobile ultrabook CPU — not ideal for heavy DSP, but sufficient for general audio work"
+  },
+  "ram": {
+    "total_gb": 16,
+    "modules": [
+      { "manufacturer": "Kingston", "part": "KHX2400C14S4/8G", "size_gb": 8, "speed_mhz": 2400 },
+      { "manufacturer": "Samsung", "part": "M471A1K43CB1-CRC", "size_gb": 8, "speed_mhz": 2400 }
+    ]
+  },
+  "motherboard": {
+    "manufacturer": "ASUSTeK COMPUTER INC.",
+    "product": "X510UAR",
+    "form_factor": "laptop"
+  },
+  "gpu": {
+    "name": "Intel UHD Graphics 620",
+    "vram_mb": 1024,
+    "driver_version": "27.20.100.8682"
+  },
+  "storage": [
+    { "disk": 0, "name": "Micron 1100 MTFDDAK2T0TBN", "size_gb": 1908, "type": "SATA SSD", "status": "RAW/unallocated", "purpose": "Reserved for Ubuntu" },
+    { "disk": 1, "name": "Samsung SSD 860 EVO M.2 500GB", "size_gb": 466, "type": "M.2 SATA SSD", "status": "Online (GPT)", "purpose": "Windows boot + dev" }
+  ],
+  "audio_devices": [
+    {
+      "name": "Conexant SmartAudio HD",
+      "type": "built-in",
+      "bus": "HDA",
+      "device_id": "HDAUDIO\\FUNC_01&VEN_14F1&DEV_1F72&SUBSYS_10431A40&REV_1000",
+      "manufacturer": "Conexant",
+      "endpoints": {
+        "playback": { "name": "Speakers (Conexant SmartAudio HD)", "status": "active" },
+        "capture": { "name": "Microphone (Conexant SmartAudio HD)", "status": "active" }
+      },
+      "notes": "Laptop built-in. Adequate for casual monitoring, not for production."
+    },
+    {
+      "name": "Intel Display Audio",
+      "type": "built-in",
+      "bus": "HDA",
+      "device_id": "HDAUDIO\\FUNC_01&VEN_8086&DEV_280B&SUBSYS_80860101&REV_1000",
+      "manufacturer": "Intel Corporation",
+      "endpoints": {
+        "playback": { "name": "HDMI/DisplayPort audio output", "status": "no endpoints active" }
+      },
+      "notes": "Only relevant if using external monitor with speakers via HDMI/DP."
+    },
+    {
+      "name": "Virtual Desktop Audio",
+      "type": "software",
+      "device_id": "ROOT\\MEDIA\\0001",
+      "manufacturer": "Virtual Desktop",
+      "notes": "Software audio routing device. Can be removed if Virtual Desktop is no longer used."
+    }
+  ],
+  "bluetooth_audio": [
+    {
+      "name": "Sony MDR-XB950B1",
+      "type": "bluetooth_headphones",
+      "profiles": ["A2DP", "HFP"],
+      "device_id": "BTHENUM\\DEV_CC988B62A07E",
+      "vid_pid": "054C:0C4A",
+      "notes": "Bluetooth headphones. A2DP adds 100-300ms latency. NOT suitable for real-time audio monitoring."
+    },
+    {
+      "name": "DPX50*",
+      "type": "bluetooth_audio",
+      "profiles": ["A2DP", "HFP", "AVRCP"],
+      "vid_pid": "0876:0086",
+      "notes": "Bluetooth audio device. Same latency concerns as above."
+    }
+  ],
+  "midi_devices": [
+    {
+      "name": "teVirtualMIDI - Virtual MIDI Driver x64",
+      "type": "software",
+      "device_id": "ROOT\\MEDIA\\0000",
+      "notes": "Virtual MIDI driver — useful for inter-app MIDI routing."
+    },
+    {
+      "name": "Bome Virtual MIDI Enumerator",
+      "type": "software",
+      "device_id": "ROOT\\SYSTEM\\0001",
+      "notes": "Bome MIDI Translator companion. Enables virtual MIDI ports for controller mapping."
+    }
+  ],
+  "usb_audio_interfaces": [],
+  "asio_drivers": [
+    { "name": "ASIO4ALL v2", "clsid": "{232685C6-6548-49D8-846D-4141A3EF7560}", "notes": "Generic ASIO wrapper. Adds latency vs native ASIO but required when no hardware ASIO driver exists." },
+    { "name": "FL Studio ASIO", "clsid": "{188135E1-7171-3434-854F-01A3C71F3DF9}", "notes": "FL Studio proprietary ASIO. Only usable inside FL Studio." }
+  ],
+  "bluetooth_input": [
+    { "name": "Logitech Keyboard K380", "device_id": "BTHENUM\\DEV_34885D79E8B2" },
+    { "name": "Logitech MX Master 2S", "type": "BLE" }
+  ],
+  "network": {
+    "wifi": { "name": "Intel Dual Band Wireless-AC 8265", "speed": "866.7 Mbps", "dpc_risk": "medium" },
+    "virtual_switches": [
+      "vEthernet (Default Switch) — Hyper-V",
+      "vEthernet (WSL) — Hyper-V firewall"
+    ]
+  },
+  "audio_services": {
+    "AudioEndpointBuilder": "Running",
+    "Audiosrv": "Running",
+    "BTAGService": "Running",
+    "CxAudMsg": "Running (Conexant)",
+    "SAService": "Running (Conexant SmartAudio)"
+  },
+  "debloat_status": {
+    "power_plan": "High Performance",
+    "usb_selective_suspend": "Disabled (AC + DC)",
+    "processor_scheduling": "Programs (Win32PrioritySeparation=38)",
+    "system_sounds": "No Sounds",
+    "game_dvr": "Disabled",
+    "search_indexing": "Disabled",
+    "applied_date": "2026-03-04"
+  }
+}

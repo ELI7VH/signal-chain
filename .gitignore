@@ -1,0 +1,4 @@
+# Machine-specific binaries (source is tracked, builds are not)
+*.exe
+*.o
+*.obj
