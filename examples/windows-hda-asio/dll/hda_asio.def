@@ -1,0 +1,7 @@
+; hda_asio.def -- ASIO DLL exports for COM in-process server
+LIBRARY hda_asio
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE
