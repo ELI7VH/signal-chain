@@ -1,0 +1,23 @@
+description = "Generate optimal audio configuration from hardware-fingerprint.json."
+
+prompt = """
+Run the config-generator agent procedure from agents/config-generator.md.
+
+Read hardware-fingerprint.json and generate optimal audio configuration:
+
+Current fingerprint:
+```json
+@{hardware-fingerprint.json}
+```
+
+Generate all config artifacts into ./signal-chain-output/:
+- Linux: .asoundrc, udev rules, RT limits, PipeWire/JACK config
+- macOS: aggregate device config, CoreAudio overrides
+- Windows: ASIO shim config, WASAPI exclusive mode
+
+Ask for:
+1. Rig intent (recording, live performance, looping, synthesis, DJ)
+2. Latency target (ultra-low <3ms, low <10ms, balanced <20ms, relaxed)
+
+Then generate the configs and explain what abstraction layers were eliminated.
+"""

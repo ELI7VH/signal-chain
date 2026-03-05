@@ -110,6 +110,37 @@ For a given hardware snapshot, signal-chain would produce:
 - Optimal buffer size calculation based on device DMA and host interrupt intervals
 - Format conversion elimination map (which paths need no conversion)
 
+## Framework Support
+
+Signal-chain is framework-agnostic. The agent definitions are plain markdown — they describe *what to do*, not how any specific tool does it. Framework adapters provide the manifest wiring for each platform.
+
+```
+frameworks/
+  claude/     — .claude-plugin/plugin.json, symlinks to shared agents/commands/skills
+  codex/      — AGENTS.md + .codex/skills/signal-chain/SKILL.md
+  gemini/     — GEMINI.md + .gemini/commands/*.toml (with shell + file injection)
+  custom/     — Guide for adapting to any framework
+```
+
+| Framework | Install | Commands |
+|-----------|---------|----------|
+| **Claude Code** | Copy `.claude-plugin/`, symlink agents/commands/skills | `/signal-chain:audit`, `/signal-chain:generate` |
+| **Codex CLI** | Copy `AGENTS.md` + `.codex/skills/` | Skill auto-activates on audio topics |
+| **Gemini CLI** | Copy `GEMINI.md` + `.gemini/commands/` | `/audit`, `/generate` |
+| **Cursor** | Concatenate agents into `.cursor/rules/` | Agent-decided activation |
+| **Other** | Concatenate agent markdown into your instructions file | Ask directly |
+
+See each framework's `README.md` for setup details.
+
+### Adding a New Framework
+
+1. Create `frameworks/<name>/`
+2. Add the platform's manifest/config that references the shared agent files
+3. Add a `README.md` with setup instructions
+4. Submit a PR
+
+The agent content stays in one place. Framework adapters are just wiring.
+
 ## Status
 
 This is a concept + proof of work, not a finished tool. The WaveLoop Pi build proved the principle. The next step is building the snapshot → config generator.

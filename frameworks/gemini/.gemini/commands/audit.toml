@@ -1,0 +1,39 @@
+description = "Fingerprint all audio and MIDI hardware on this machine. Produces hardware-fingerprint.json."
+
+prompt = """
+Run the hardware-auditor agent procedure from agents/hardware-auditor.md.
+
+Enumerate all audio and MIDI hardware on this machine:
+1. Detect platform (Linux/macOS/Windows)
+2. Read USB device descriptors
+3. Probe ALSA/CoreAudio/WASAPI capabilities per device, per direction
+4. Enumerate MIDI devices
+5. Map USB topology
+6. Write hardware-fingerprint.json
+7. Print a summary
+
+Current system info:
+```
+!{uname -a 2>/dev/null || ver 2>/dev/null || echo "unknown"}
+```
+
+USB devices:
+```
+!{lsusb 2>/dev/null || system_profiler SPUSBDataType 2>/dev/null || echo "no lsusb"}
+```
+
+ALSA playback devices:
+```
+!{aplay -l 2>/dev/null || echo "no ALSA"}
+```
+
+ALSA capture devices:
+```
+!{arecord -l 2>/dev/null || echo "no ALSA"}
+```
+
+MIDI devices:
+```
+!{amidi -l 2>/dev/null || echo "no MIDI"}
+```
+"""

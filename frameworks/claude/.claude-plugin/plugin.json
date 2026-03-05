@@ -1,0 +1,17 @@
+{
+  "name": "signal-chain",
+  "version": "0.1.0",
+  "description": "AI-generated custom audio orchestration for known hardware configurations. Snapshot your hardware, generate optimal ALSA/ASIO/CoreAudio configs, eliminate the abstraction tax. 3 agents, 2 commands, 1 skill.",
+  "author": {
+    "name": "Elijah Lucian",
+    "url": "https://elijahlucian.ca"
+  },
+  "homepage": "https://waveloop.app",
+  "repository": "https://github.com/ELI7VH/signal-chain",
+  "license": "MIT",
+  "keywords": [
+    "audio", "alsa", "asio", "coreaudio", "drivers",
+    "hardware", "low-latency", "realtime", "usb-audio",
+    "midi", "raspberry-pi", "orchestration"
+  ]
+}
