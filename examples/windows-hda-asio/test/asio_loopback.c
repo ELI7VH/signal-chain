@@ -61,9 +61,9 @@ static void ASIO_bufferSwitch(long doubleBufferIndex, ASIOBool directProcess)
             void *dst = g_bufferInfos[outIdx].buffers[doubleBufferIndex];
 
             if (src && dst) {
-                /* Copy interleaved frame data.
-                 * For 16-bit stereo at 160 frames: 160 * 4 = 640 bytes per half */
-                memcpy(dst, src, g_bufferSize * 4);  /* blockAlign=4 for stereo 16-bit */
+                /* Copy per-channel non-interleaved data.
+                 * 16-bit mono: bufferSize * 2 bytes per channel */
+                memcpy(dst, src, g_bufferSize * 2);  /* sizeof(int16_t) per sample */
             }
         }
     }

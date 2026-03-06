@@ -485,11 +485,17 @@ HandleSetPinState(
 
     KdPrint(("HdaBridge: Setting pin state to %u\n", in->State));
 
+    /*
+     * KS SET: input has descriptor+value, output has just the value.
+     * The KS handler reads the state from the output buffer (UserBuffer).
+     */
+    KSSTATE stateOut = (KSSTATE)in->State;
+    ULONG bytesReturned = 0;
     status = SendKsProperty(
         pinFileObject,
         &stateReq, sizeof(stateReq),
-        NULL, 0,
-        NULL
+        &stateOut, sizeof(stateOut),
+        &bytesReturned
     );
 
     if (!NT_SUCCESS(status)) {

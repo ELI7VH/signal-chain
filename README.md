@@ -141,11 +141,38 @@ See each framework's `README.md` for setup details.
 
 The agent content stays in one place. Framework adapters are just wiring.
 
+## Proof: Custom ASIO Driver on Windows
+
+**We built a working ASIO driver from scratch for a laptop's built-in Conexant codec.**
+
+- 6.67ms round-trip (160 frames @ 48kHz)
+- WASAPI exclusive mode backend, proper ASIO COM interface
+- Tested in FL Studio and Studio One
+- Bit-perfect buffer validation (288,000 samples, zero mismatches)
+- Supports 44.1kHz and 48kHz with live rate switching
+- Built entirely with MinGW (37MB toolchain, no WDK, no Steinberg SDK)
+
+**Full writeup:** [`examples/windows-hda-asio/`](./examples/windows-hda-asio/)
+
+## Testing Domains
+
+Organized test patterns for hardware-specific development:
+
+| Domain | Status | Description |
+|--------|--------|-------------|
+| [Audio](./domains/audio/) | **Proven** | ASIO/WASAPI driver testing, buffer validation, DAW integration |
+| USB | Planned | Endpoint enumeration, format negotiation, isochronous timing |
+| GPIO/Embedded | Planned | Pi GPIO, SPI/I2C, display drivers, RT scheduling |
+| MIDI | Planned | USB MIDI, SysEx round-trip, clock jitter |
+| Network | Planned | Dante/AES67/AVB, PTP sync, packet jitter |
+
+See [`domains/README.md`](./domains/) for details and how to contribute.
+
 ## Status
 
-This is a concept + proof of work, not a finished tool. The WaveLoop Pi build proved the principle. The next step is building the snapshot → config generator.
+This started as a concept + proof of work. The WaveLoop Pi build proved the principle on Linux. The Windows ASIO driver proved it on Windows. **The abstraction tax is real, and AI can eliminate it.**
 
-Contributions, ideas, and war stories about audio driver pain are welcome.
+Next: more domains, more hardware, more platforms.
 
 ## Related
 

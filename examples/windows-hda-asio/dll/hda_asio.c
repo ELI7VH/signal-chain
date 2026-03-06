@@ -3,19 +3,18 @@
  *
  * signal-chain experiment: custom ASIO driver for Conexant CX20753/4
  *
- * This is a COM in-process server that implements the ASIO interface.
- * It creates KS pins directly on the HDA wave filter (user-mode operation),
- * then uses the hda_bridge.sys kernel driver to allocate WaveRT DMA buffers
- * (the one operation requiring kernel mode).
+ * WASAPI Exclusive Mode backend. Uses event-driven exclusive mode for
+ * direct hardware access at minimum latency. The KS direct path was
+ * found to be blocked by the Conexant miniport driver (error 22 on
+ * state transitions, no RTAUDIO properties), but WASAPI exclusive mode
+ * accesses the same DMA hardware through a supported API path.
  *
- * The hot path (bufferSwitch callback) runs entirely in user mode:
- *   - Read capture samples from DMA buffer (zero-copy)
- *   - Write render samples to DMA buffer (zero-copy)
- *   - Read hardware position register (zero-syscall)
+ * Already proven at 6.67ms round-trip (160 frames @ 48kHz).
  *
  * Build (MinGW/w64devkit):
- *   gcc -shared -O2 -Wall -o hda_asio.dll hda_asio.c hda_asio.def
- *       -lole32 -loleaut32 -lsetupapi -lksuser -lavrt -luuid
+ *   gcc -shared -O2 -Wall -Wno-unknown-pragmas -I../include \
+ *       -o hda_asio.dll ../dll/hda_asio.c ../dll/hda_asio.def \
+ *       -lole32 -loleaut32 -lavrt -luuid
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -24,49 +23,62 @@
 
 #include <windows.h>
 #include <objbase.h>
-#include <setupapi.h>
 #include <mmreg.h>
-#include <ks.h>
-#include <ksmedia.h>
+#include <audioclient.h>
+#include <mmdeviceapi.h>
 #include <avrt.h>
 #include <olectl.h>
 #include <stdio.h>
 #include <string.h>
 
-/* Our headers */
+/* Our ASIO header */
 #include "../include/asio.h"
-#include "../include/hda_bridge_ioctl.h"
 
-/* ---- KS GUIDs (from ksuser.lib) ---- */
+/* ---- WASAPI GUIDs (defined locally to avoid MinGW link issues) ---- */
 
-/* These are already in ksuser.lib, declare as extern */
-extern const GUID KSCATEGORY_AUDIO;
-extern const GUID KSCATEGORY_RENDER;
-extern const GUID KSCATEGORY_CAPTURE;
-extern const GUID KSPROPSETID_Pin;
-extern const GUID KSPROPSETID_Connection;
-extern const GUID KSDATAFORMAT_TYPE_AUDIO;
-extern const GUID KSDATAFORMAT_SUBTYPE_PCM;
-extern const GUID KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
+DEFINE_GUID(local_CLSID_MMDeviceEnumerator,
+    0xBCDE0395, 0xE52F, 0x467C,
+    0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E);
+DEFINE_GUID(local_IID_IMMDeviceEnumerator,
+    0xA95664D2, 0x9614, 0x4F35,
+    0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6);
+DEFINE_GUID(local_IID_IAudioClient,
+    0x1CB9AD4C, 0xDBFA, 0x4C32,
+    0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2);
+DEFINE_GUID(local_IID_IAudioCaptureClient,
+    0xC8ADBD64, 0xE71E, 0x48A0,
+    0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17);
+DEFINE_GUID(local_IID_IAudioRenderClient,
+    0xF294ACFC, 0x3146, 0x4483,
+    0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2);
 
-/* Interface GUIDs -- define locally */
-DEFINE_GUID(LOCAL_KSINTERFACESETID_Standard,
-    0x1A8766A0L, 0x62CE, 0x11CF, 0xA5, 0xD6, 0x28, 0xDB, 0x04, 0xC1, 0x00, 0x00);
-DEFINE_GUID(LOCAL_KSMEDIUMSETID_Standard,
-    0x4747B320L, 0x62CE, 0x11CF, 0xA5, 0xD6, 0x28, 0xDB, 0x04, 0xC1, 0x00, 0x00);
+/* KSDATAFORMAT_SUBTYPE_PCM for WAVEFORMATEXTENSIBLE */
+DEFINE_GUID(local_KSDATAFORMAT_SUBTYPE_PCM,
+    0x00000001, 0x0000, 0x0010,
+    0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71);
 
-/* KS interface IDs */
-#ifndef KSINTERFACE_STANDARD_LOOPED_STREAMING
-#define KSINTERFACE_STANDARD_LOOPED_STREAMING 2
+/* ---- Constants that may be missing from MinGW headers ---- */
+
+#ifndef AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
+#define AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED  ((HRESULT)0x88890019L)
 #endif
 
-/* KS IOCTLs (may not be in w64devkit headers) */
-#ifndef FILE_DEVICE_KS
-#define FILE_DEVICE_KS 0x0000002F
+#ifndef AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+#define AUDCLNT_STREAMFLAGS_EVENTCALLBACK  0x00040000
 #endif
-#ifndef IOCTL_KS_PROPERTY
-#include <winioctl.h>
-#define IOCTL_KS_PROPERTY CTL_CODE(FILE_DEVICE_KS, 0x000, METHOD_NEITHER, FILE_ANY_ACCESS)
+
+#ifndef AUDCLNT_BUFFERFLAGS_SILENT
+#define AUDCLNT_BUFFERFLAGS_SILENT  0x2
+#endif
+
+#ifndef SPEAKER_FRONT_LEFT
+#define SPEAKER_FRONT_LEFT   0x1
+#define SPEAKER_FRONT_RIGHT  0x2
+#endif
+
+#ifndef _REFERENCE_TIME_
+#define _REFERENCE_TIME_
+typedef LONGLONG REFERENCE_TIME;
 #endif
 
 /* ---- Configuration ---- */
@@ -76,7 +88,10 @@ DEFINE_GUID(LOCAL_KSMEDIUMSETID_Standard,
 #define HDA_NUM_CHANNELS        2
 #define HDA_BLOCK_ALIGN         (HDA_NUM_CHANNELS * HDA_BITS_PER_SAMPLE / 8)
 #define HDA_PREFERRED_FRAMES    160     /* 3.33ms at 48kHz -- HDA codec minimum */
-#define HDA_BYTES_PER_BUFFER    (HDA_PREFERRED_FRAMES * HDA_BLOCK_ALIGN)
+
+/* Convert frames to REFERENCE_TIME (100-nanosecond units) */
+#define FRAMES_TO_REFTIME(frames, rate) \
+    ((REFERENCE_TIME)(((LONGLONG)(frames) * 10000000LL) / (rate)))
 
 /* ---- ASIO Driver State ---- */
 
@@ -91,33 +106,29 @@ typedef struct _HDA_ASIO_DRIVER {
     BOOL            running;
     HWND            sysHandle;
     char            errorMessage[124];
+    UINT32          currentRate;            /* active sample rate (44100 or 48000) */
 
-    /* Kernel bridge */
-    HANDLE          hBridge;        /* Handle to \\.\HdaAsioBridge */
+    /* WASAPI audio clients (one per direction) */
+    IAudioClient        *pCapAudioClient;
+    IAudioClient        *pRenAudioClient;
 
-    /* KS handles */
-    HANDLE          hCaptureFilter; /* HDA capture wave filter */
-    HANDLE          hRenderFilter;  /* HDA render wave filter */
-    HANDLE          hCapturePin;    /* KS capture pin */
-    HANDLE          hRenderPin;     /* KS render pin */
+    /* WASAPI streaming sub-clients (acquired at start, released at stop) */
+    IAudioCaptureClient *pCapClient;
+    IAudioRenderClient  *pRenClient;
 
-    /* Device paths (found during enumeration) */
-    WCHAR           captureFilterPath[512];
-    WCHAR           renderFilterPath[512];
+    /* Event handles for WASAPI event-driven mode */
+    HANDLE          hCaptureEvent;
+    HANDLE          hRenderEvent;
 
-    /* DMA buffers (mapped by kernel bridge) */
-    void           *captureBuffer;      /* DMA buffer for capture */
-    ULONG           captureBufferSize;
-    void           *renderBuffer;       /* DMA buffer for render */
-    ULONG           renderBufferSize;
+    /* Actual buffer sizes from WASAPI (in frames) */
+    UINT32          captureFrames;
+    UINT32          renderFrames;
 
-    /* Position registers (mapped by kernel bridge, may be NULL) */
-    volatile ULONG *capturePosition;
-    volatile ULONG *renderPosition;
-
-    /* ASIO double-buffering */
-    long            bufferSize;         /* Frames per half-buffer */
-    void           *asioBuffers[2][4];  /* [half][channel] -- up to 2in + 2out */
+    /* ASIO per-channel double-buffers (non-interleaved, as ASIO expects) */
+    long            bufferSize;                     /* Frames per half-buffer */
+    void           *capCh[HDA_NUM_CHANNELS][2];     /* [channel][half] capture */
+    void           *renCh[HDA_NUM_CHANNELS][2];     /* [channel][half] render */
+    void           *asioBuffers[2][4];              /* [half][channel] -- up to 2in + 2out */
     long            numInputChannels;
     long            numOutputChannels;
     ASIOCallbacks  *callbacks;
@@ -126,6 +137,7 @@ typedef struct _HDA_ASIO_DRIVER {
     HANDLE          hThread;
     HANDLE          hStopEvent;
     volatile LONG   currentBufferIndex;
+    volatile LONGLONG samplePosition;
 
 } HDA_ASIO_DRIVER;
 
@@ -143,6 +155,7 @@ static ASIOError STDMETHODCALLTYPE Asio_stop(IASIO *This);
 static ASIOError STDMETHODCALLTYPE Asio_getChannels(IASIO *This, long *numIn, long *numOut);
 static ASIOError STDMETHODCALLTYPE Asio_getLatencies(IASIO *This, long *inputLatency, long *outputLatency);
 static ASIOError STDMETHODCALLTYPE Asio_getBufferSize(IASIO *This, long *minSize, long *maxSize, long *preferredSize, long *granularity);
+static ASIOError STDMETHODCALLTYPE Asio_canSampleRate(IASIO *This, ASIOSampleRate rate);
 static ASIOError STDMETHODCALLTYPE Asio_getSampleRate(IASIO *This, ASIOSampleRate *rate);
 static ASIOError STDMETHODCALLTYPE Asio_setSampleRate(IASIO *This, ASIOSampleRate rate);
 static ASIOError STDMETHODCALLTYPE Asio_getClockSources(IASIO *This, ASIOClockSource *clocks, long *numSources);
@@ -170,6 +183,7 @@ static IASIOVtbl g_AsioVtbl = {
     Asio_getChannels,
     Asio_getLatencies,
     Asio_getBufferSize,
+    Asio_canSampleRate,
     Asio_getSampleRate,
     Asio_setSampleRate,
     Asio_getClockSources,
@@ -188,163 +202,100 @@ static IASIOVtbl g_AsioVtbl = {
 static volatile LONG g_dllRefCount = 0;
 static HINSTANCE     g_hInstance = NULL;
 
-/* ---- Utility: find HDA wave filter by category ---- */
+/* ---- Helper: build our PCM format descriptor ---- */
 
-static BOOL
-FindHdaWaveFilter(const GUID *category, WCHAR *pathOut, DWORD pathOutChars)
+static void
+BuildWaveFormat(WAVEFORMATEXTENSIBLE *pWfx, UINT32 sampleRate)
 {
-    HDEVINFO devInfo;
-    SP_DEVICE_INTERFACE_DATA ifData;
-    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = NULL;
-    DWORD needed;
-    BOOL found = FALSE;
-    DWORD idx;
+    ZeroMemory(pWfx, sizeof(*pWfx));
+    pWfx->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    pWfx->Format.nChannels = HDA_NUM_CHANNELS;
+    pWfx->Format.nSamplesPerSec = sampleRate;
+    pWfx->Format.wBitsPerSample = HDA_BITS_PER_SAMPLE;
+    pWfx->Format.nBlockAlign = HDA_BLOCK_ALIGN;
+    pWfx->Format.nAvgBytesPerSec = sampleRate * HDA_BLOCK_ALIGN;
+    pWfx->Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+    pWfx->Samples.wValidBitsPerSample = HDA_BITS_PER_SAMPLE;
+    pWfx->dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+    pWfx->SubFormat = local_KSDATAFORMAT_SUBTYPE_PCM;
+}
 
-    devInfo = SetupDiGetClassDevsW(category, NULL, NULL,
-        DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
-    if (devInfo == INVALID_HANDLE_VALUE) return FALSE;
+/* ---- Helper: initialize one WASAPI exclusive mode client ---- */
 
-    ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+static HRESULT
+InitWasapiClient(IMMDevice *pDevice, WAVEFORMATEXTENSIBLE *pFmt,
+                 IAudioClient **ppClient, HANDLE hEvent, UINT32 *pFrames,
+                 const char *label)
+{
+    IAudioClient *pClient = NULL;
+    HRESULT hr;
+    REFERENCE_TIME duration;
+    UINT32 rate = pFmt->Format.nSamplesPerSec;
 
-    for (idx = 0; SetupDiEnumDeviceInterfaces(devInfo, NULL, category, idx, &ifData); idx++) {
-        SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, NULL, 0, &needed, NULL);
-        detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)malloc(needed);
-        if (!detail) continue;
-        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-
-        if (SetupDiGetDeviceInterfaceDetailW(devInfo, &ifData, detail, needed, NULL, NULL)) {
-            /* Look for HDA wave filter (not topology, not software engine) */
-            WCHAR *path = detail->DevicePath;
-            BOOL isHda = (wcsstr(path, L"hdaudio") != NULL);
-            BOOL isWave = (wcsstr(path, L"wave") != NULL);
-
-            if (isHda && isWave) {
-                wcsncpy(pathOut, path, pathOutChars - 1);
-                pathOut[pathOutChars - 1] = L'\0';
-                found = TRUE;
-                free(detail);
-                break;
-            }
-        }
-        free(detail);
+    hr = pDevice->lpVtbl->Activate(pDevice, &local_IID_IAudioClient,
+                                    CLSCTX_ALL, NULL, (void **)&pClient);
+    if (FAILED(hr)) {
+        fprintf(stderr, "  [%s] Activate IAudioClient failed: 0x%08lX\n", label, hr);
+        return hr;
     }
 
-    SetupDiDestroyDeviceInfoList(devInfo);
-    return found;
-}
+    /* Request our preferred period */
+    duration = FRAMES_TO_REFTIME(HDA_PREFERRED_FRAMES, rate);
 
-/* ---- Utility: create a WaveRT KS pin ---- */
+    hr = pClient->lpVtbl->Initialize(pClient,
+        AUDCLNT_SHAREMODE_EXCLUSIVE,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        duration, duration,
+        (WAVEFORMATEX *)pFmt, NULL);
 
-static HANDLE
-CreateWaveRtPin(HANDLE hFilter, DWORD pinId, BOOL isCapture)
-{
-    /*
-     * Build KSPIN_CONNECT + KSDATAFORMAT_WAVEFORMATEX for WaveRT looped streaming.
-     * This is the same technique proven in our KS passthrough experiment.
-     */
-    struct {
-        KSPIN_CONNECT           Connect;
-        KSDATAFORMAT_WAVEFORMATEX DataFormat;
-    } pinRequest;
+    /* Handle buffer alignment requirement */
+    if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+        UINT32 aligned = 0;
+        pClient->lpVtbl->GetBufferSize(pClient, &aligned);
+        fprintf(stderr, "  [%s] Buffer not aligned, retrying with %u frames\n",
+                label, aligned);
+        pClient->lpVtbl->Release(pClient);
 
-    HANDLE hPin = NULL;
-    DWORD err;
+        duration = FRAMES_TO_REFTIME(aligned, rate);
 
-    ZeroMemory(&pinRequest, sizeof(pinRequest));
+        hr = pDevice->lpVtbl->Activate(pDevice, &local_IID_IAudioClient,
+                                        CLSCTX_ALL, NULL, (void **)&pClient);
+        if (FAILED(hr)) return hr;
 
-    /* Pin connect header */
-    pinRequest.Connect.Interface.Set = LOCAL_KSINTERFACESETID_Standard;
-    pinRequest.Connect.Interface.Id = KSINTERFACE_STANDARD_LOOPED_STREAMING;
-    pinRequest.Connect.Medium.Set = LOCAL_KSMEDIUMSETID_Standard;
-    pinRequest.Connect.Medium.Id = 0;  /* KSMEDIUM_STANDARD_DEVIO */
-    pinRequest.Connect.PinId = pinId;
-    pinRequest.Connect.PinToHandle = NULL;
-    pinRequest.Connect.Priority.PriorityClass = KSPRIORITY_NORMAL;
-    pinRequest.Connect.Priority.PrioritySubClass = KSPRIORITY_NORMAL;
-
-    /* Data format: PCM stereo 48kHz 16-bit */
-    pinRequest.DataFormat.DataFormat.MajorFormat = KSDATAFORMAT_TYPE_AUDIO;
-    pinRequest.DataFormat.DataFormat.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
-    pinRequest.DataFormat.DataFormat.Specifier = KSDATAFORMAT_SPECIFIER_WAVEFORMATEX;
-    pinRequest.DataFormat.DataFormat.FormatSize = sizeof(KSDATAFORMAT_WAVEFORMATEX);
-    pinRequest.DataFormat.DataFormat.SampleSize = HDA_BLOCK_ALIGN;
-
-    pinRequest.DataFormat.WaveFormatEx.wFormatTag = WAVE_FORMAT_PCM;
-    pinRequest.DataFormat.WaveFormatEx.nChannels = HDA_NUM_CHANNELS;
-    pinRequest.DataFormat.WaveFormatEx.nSamplesPerSec = HDA_SAMPLE_RATE;
-    pinRequest.DataFormat.WaveFormatEx.wBitsPerSample = HDA_BITS_PER_SAMPLE;
-    pinRequest.DataFormat.WaveFormatEx.nBlockAlign = HDA_BLOCK_ALIGN;
-    pinRequest.DataFormat.WaveFormatEx.nAvgBytesPerSec = HDA_SAMPLE_RATE * HDA_BLOCK_ALIGN;
-    pinRequest.DataFormat.WaveFormatEx.cbSize = 0;
-
-    err = KsCreatePin(hFilter, &pinRequest.Connect, GENERIC_READ | GENERIC_WRITE, &hPin);
-    if (err != ERROR_SUCCESS) {
-        return NULL;
-    }
-    return hPin;
-}
-
-/* ---- Utility: bridge IOCTL helpers ---- */
-
-static BOOL
-BridgeAllocBuffer(HANDLE hBridge, HANDLE hPin, ULONG requestedSize,
-                  void **bufferOut, ULONG *sizeOut)
-{
-    HDA_ALLOC_BUFFER_IN in;
-    HDA_ALLOC_BUFFER_OUT out;
-    DWORD bytesReturned;
-
-    in.PinHandle = (ULONG_PTR)hPin;
-    in.RequestedSize = requestedSize;
-
-    if (!DeviceIoControl(hBridge, IOCTL_HDA_ALLOC_RT_BUFFER,
-            &in, sizeof(in), &out, sizeof(out), &bytesReturned, NULL)) {
-        return FALSE;
+        hr = pClient->lpVtbl->Initialize(pClient,
+            AUDCLNT_SHAREMODE_EXCLUSIVE,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            duration, duration,
+            (WAVEFORMATEX *)pFmt, NULL);
     }
 
-    *bufferOut = (void *)out.BufferAddress;
-    *sizeOut = out.BufferSize;
-    return TRUE;
-}
-
-static BOOL
-BridgeFreeBuffer(HANDLE hBridge, HANDLE hPin)
-{
-    HDA_FREE_BUFFER_IN in;
-    DWORD bytesReturned;
-
-    in.PinHandle = (ULONG_PTR)hPin;
-    return DeviceIoControl(hBridge, IOCTL_HDA_FREE_RT_BUFFER,
-        &in, sizeof(in), NULL, 0, &bytesReturned, NULL);
-}
-
-static BOOL
-BridgeSetPinState(HANDLE hBridge, HANDLE hPin, ULONG state)
-{
-    HDA_SET_STATE_IN in;
-    DWORD bytesReturned;
-
-    in.PinHandle = (ULONG_PTR)hPin;
-    in.State = state;
-    return DeviceIoControl(hBridge, IOCTL_HDA_SET_PIN_STATE,
-        &in, sizeof(in), NULL, 0, &bytesReturned, NULL);
-}
-
-static volatile ULONG *
-BridgeMapPosition(HANDLE hBridge, HANDLE hPin)
-{
-    HDA_POSITION_MAP_IN in;
-    HDA_POSITION_MAP_OUT out;
-    DWORD bytesReturned;
-
-    in.PinHandle = (ULONG_PTR)hPin;
-    ZeroMemory(&out, sizeof(out));
-
-    if (!DeviceIoControl(hBridge, IOCTL_HDA_GET_RT_POSITION,
-            &in, sizeof(in), &out, sizeof(out), &bytesReturned, NULL)) {
-        return NULL;
+    if (FAILED(hr)) {
+        fprintf(stderr, "  [%s] Initialize failed: 0x%08lX\n", label, hr);
+        pClient->lpVtbl->Release(pClient);
+        return hr;
     }
-    return (volatile ULONG *)out.PositionRegister;
+
+    /* Set event handle */
+    hr = pClient->lpVtbl->SetEventHandle(pClient, hEvent);
+    if (FAILED(hr)) {
+        fprintf(stderr, "  [%s] SetEventHandle failed: 0x%08lX\n", label, hr);
+        pClient->lpVtbl->Release(pClient);
+        return hr;
+    }
+
+    /* Get actual buffer size */
+    hr = pClient->lpVtbl->GetBufferSize(pClient, pFrames);
+    if (FAILED(hr)) {
+        fprintf(stderr, "  [%s] GetBufferSize failed: 0x%08lX\n", label, hr);
+        pClient->lpVtbl->Release(pClient);
+        return hr;
+    }
+
+    fprintf(stderr, "  [%s] WASAPI exclusive: %u frames (%.2fms @ %uHz)\n",
+            label, *pFrames, (double)*pFrames / rate * 1000.0, rate);
+
+    *ppClient = pClient;
+    return S_OK;
 }
 
 /* ---- Streaming thread ---- */
@@ -353,65 +304,98 @@ static DWORD WINAPI
 StreamingThread(LPVOID param)
 {
     HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)param;
+    HANDLE waitHandles[2];
     DWORD taskIndex = 0;
     HANDLE hTask;
-    ULONG lastCapPos = 0;
-    ULONG halfBufferBytes;
     long bufferIndex = 0;
+    HRESULT hr;
+
+    waitHandles[0] = drv->hStopEvent;
+    waitHandles[1] = drv->hCaptureEvent;
 
     /* Boost thread priority via MMCSS */
     hTask = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
 
-    halfBufferBytes = drv->bufferSize * HDA_BLOCK_ALIGN;
+    while (1) {
+        DWORD wait = WaitForMultipleObjects(2, waitHandles, FALSE, 2000);
 
-    while (WaitForSingleObject(drv->hStopEvent, 0) == WAIT_TIMEOUT) {
-        /*
-         * Position tracking strategy:
-         *   If hardware position register is available, read it directly (zero-syscall).
-         *   Otherwise, use a timer-based approach.
-         *
-         *   The DMA buffer is split into two halves for ASIO double-buffering.
-         *   When the hardware position crosses a half-buffer boundary, fire the
-         *   ASIO bufferSwitch callback.
-         */
-        ULONG capPos = 0;
+        if (wait == WAIT_OBJECT_0) break;        /* Stop event signaled */
+        if (wait != WAIT_OBJECT_0 + 1) continue; /* Timeout or error */
 
-        if (drv->capturePosition) {
-            capPos = *(drv->capturePosition);
-        } else {
-            /* Fallback: estimate position based on time */
-            static LARGE_INTEGER startTime = {0};
-            LARGE_INTEGER now, freq;
-            if (startTime.QuadPart == 0) QueryPerformanceCounter(&startTime);
-            QueryPerformanceCounter(&now);
-            QueryPerformanceFrequency(&freq);
-            LONGLONG elapsed = now.QuadPart - startTime.QuadPart;
-            LONGLONG bytesPlayed = (elapsed * HDA_SAMPLE_RATE * HDA_BLOCK_ALIGN) / freq.QuadPart;
-            capPos = (ULONG)(bytesPlayed % drv->captureBufferSize);
-        }
+        /* --- Capture: read interleaved WASAPI -> deinterleave to per-channel ASIO buffers --- */
+        {
+            BYTE *pData = NULL;
+            UINT32 numFrames = 0;
+            DWORD flags = 0;
 
-        /* Detect half-buffer crossing */
-        ULONG lastHalf = lastCapPos / halfBufferBytes;
-        ULONG curHalf = capPos / halfBufferBytes;
+            hr = drv->pCapClient->lpVtbl->GetBuffer(drv->pCapClient,
+                &pData, &numFrames, &flags, NULL, NULL);
+            if (SUCCEEDED(hr) && numFrames > 0) {
+                UINT32 copyFrames = numFrames;
+                if ((long)copyFrames > drv->bufferSize)
+                    copyFrames = (UINT32)drv->bufferSize;
 
-        if (curHalf != lastHalf) {
-            /* The hardware just crossed into a new half -- process the completed half */
-            bufferIndex = (curHalf == 0) ? 1 : 0;  /* Process the half that just finished */
+                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                    int ch;
+                    for (ch = 0; ch < HDA_NUM_CHANNELS; ch++)
+                        ZeroMemory(drv->capCh[ch][bufferIndex],
+                                   copyFrames * (HDA_BITS_PER_SAMPLE / 8));
+                } else {
+                    /* Deinterleave: [L0,R0,L1,R1,...] -> L[0..N], R[0..N] */
+                    short *interleaved = (short *)pData;
+                    short *left  = (short *)drv->capCh[0][bufferIndex];
+                    short *right = (short *)drv->capCh[1][bufferIndex];
+                    UINT32 f;
+                    for (f = 0; f < copyFrames; f++) {
+                        left[f]  = interleaved[f * 2];
+                        right[f] = interleaved[f * 2 + 1];
+                    }
+                }
 
-            InterlockedExchange(&drv->currentBufferIndex, bufferIndex);
-
-            /* Fire ASIO callback */
-            if (drv->callbacks && drv->callbacks->bufferSwitch) {
-                drv->callbacks->bufferSwitch(bufferIndex, ASIOTrue);
+                drv->pCapClient->lpVtbl->ReleaseBuffer(drv->pCapClient, numFrames);
+            } else if (SUCCEEDED(hr)) {
+                drv->pCapClient->lpVtbl->ReleaseBuffer(drv->pCapClient, 0);
+                continue;
+            } else {
+                continue;
             }
         }
 
-        lastCapPos = capPos;
+        /* --- Fire ASIO callback --- */
+        InterlockedExchange(&drv->currentBufferIndex, bufferIndex);
+        if (drv->callbacks && drv->callbacks->bufferSwitch) {
+            drv->callbacks->bufferSwitch(bufferIndex, ASIOTrue);
+        }
 
-        /* Sleep briefly to avoid burning CPU.
-         * At 160 frames / 48kHz, each half is 3.33ms.
-         * Sleep ~1ms to wake up in time. */
-        Sleep(1);
+        /* --- Render: reinterleave from per-channel ASIO buffers -> WASAPI --- */
+        {
+            UINT32 renFrames = drv->renderFrames;
+            if ((long)renFrames > drv->bufferSize)
+                renFrames = (UINT32)drv->bufferSize;
+
+            BYTE *pData = NULL;
+            hr = drv->pRenClient->lpVtbl->GetBuffer(drv->pRenClient,
+                renFrames, &pData);
+            if (SUCCEEDED(hr)) {
+                /* Reinterleave: L[0..N], R[0..N] -> [L0,R0,L1,R1,...] */
+                short *interleaved = (short *)pData;
+                short *left  = (short *)drv->renCh[0][bufferIndex];
+                short *right = (short *)drv->renCh[1][bufferIndex];
+                UINT32 f;
+                for (f = 0; f < renFrames; f++) {
+                    interleaved[f * 2]     = left[f];
+                    interleaved[f * 2 + 1] = right[f];
+                }
+                drv->pRenClient->lpVtbl->ReleaseBuffer(drv->pRenClient,
+                    renFrames, 0);
+            }
+        }
+
+        /* Track position */
+        drv->samplePosition += drv->captureFrames;
+
+        /* Swap double buffer */
+        bufferIndex = 1 - bufferIndex;
     }
 
     if (hTask) AvRevertMmThreadCharacteristics(hTask);
@@ -445,15 +429,13 @@ Asio_Release(IASIO *This)
     HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)This;
     LONG ref = InterlockedDecrement(&drv->refCount);
     if (ref == 0) {
-        /* Clean up */
         if (drv->running) Asio_stop(This);
         if (drv->buffersCreated) Asio_disposeBuffers(This);
 
-        if (drv->hCapturePin) { CloseHandle(drv->hCapturePin); drv->hCapturePin = NULL; }
-        if (drv->hRenderPin) { CloseHandle(drv->hRenderPin); drv->hRenderPin = NULL; }
-        if (drv->hCaptureFilter) { CloseHandle(drv->hCaptureFilter); drv->hCaptureFilter = NULL; }
-        if (drv->hRenderFilter) { CloseHandle(drv->hRenderFilter); drv->hRenderFilter = NULL; }
-        if (drv->hBridge) { CloseHandle(drv->hBridge); drv->hBridge = NULL; }
+        if (drv->hCaptureEvent) { CloseHandle(drv->hCaptureEvent); drv->hCaptureEvent = NULL; }
+        if (drv->hRenderEvent) { CloseHandle(drv->hRenderEvent); drv->hRenderEvent = NULL; }
+        if (drv->pCapAudioClient) { drv->pCapAudioClient->lpVtbl->Release(drv->pCapAudioClient); drv->pCapAudioClient = NULL; }
+        if (drv->pRenAudioClient) { drv->pRenAudioClient->lpVtbl->Release(drv->pRenAudioClient); drv->pRenAudioClient = NULL; }
 
         free(drv);
         InterlockedDecrement(&g_dllRefCount);
@@ -467,98 +449,108 @@ static ASIOBool STDMETHODCALLTYPE
 Asio_init(IASIO *This, void *sysHandle)
 {
     HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)This;
+    HRESULT hr;
+    IMMDeviceEnumerator *pEnum = NULL;
+    IMMDevice *pCapDev = NULL, *pRenDev = NULL;
+    WAVEFORMATEXTENSIBLE wfx;
 
     if (drv->initialized) return ASIOTrue;
+
+    /* Default to 48kHz if no rate set yet */
+    if (drv->currentRate == 0) drv->currentRate = HDA_SAMPLE_RATE;
 
     drv->sysHandle = (HWND)sysHandle;
     drv->numInputChannels = HDA_NUM_CHANNELS;
     drv->numOutputChannels = HDA_NUM_CHANNELS;
 
-    /* Find HDA wave filters */
-    if (!FindHdaWaveFilter(&KSCATEGORY_CAPTURE, drv->captureFilterPath, 512)) {
+    /* Create device enumerator */
+    hr = CoCreateInstance(&local_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+                          &local_IID_IMMDeviceEnumerator, (void **)&pEnum);
+    if (FAILED(hr)) {
         snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                 "No HDA capture wave filter found");
-        return ASIOFalse;
-    }
-    if (!FindHdaWaveFilter(&KSCATEGORY_RENDER, drv->renderFilterPath, 512)) {
-        snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                 "No HDA render wave filter found");
+                 "Cannot create MMDeviceEnumerator (0x%08lX)", hr);
         return ASIOFalse;
     }
 
-    /* Open kernel bridge driver */
-    drv->hBridge = CreateFileW(
-        HDA_BRIDGE_USER_PATH_W,
-        GENERIC_READ | GENERIC_WRITE,
-        0, NULL, OPEN_EXISTING, 0, NULL
-    );
-    if (drv->hBridge == INVALID_HANDLE_VALUE) {
-        drv->hBridge = NULL;
+    /* Get default capture endpoint */
+    hr = pEnum->lpVtbl->GetDefaultAudioEndpoint(pEnum, eCapture, eConsole, &pCapDev);
+    if (FAILED(hr)) {
         snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                 "Cannot open HdaAsioBridge driver (is it installed?)");
+                 "No capture device (0x%08lX)", hr);
+        pEnum->lpVtbl->Release(pEnum);
         return ASIOFalse;
     }
 
-    /* Open HDA wave filters */
-    drv->hCaptureFilter = CreateFileW(
-        drv->captureFilterPath,
-        GENERIC_READ | GENERIC_WRITE,
-        0, NULL, OPEN_EXISTING, 0, NULL
-    );
-    if (drv->hCaptureFilter == INVALID_HANDLE_VALUE) {
-        drv->hCaptureFilter = NULL;
+    /* Get default render endpoint */
+    hr = pEnum->lpVtbl->GetDefaultAudioEndpoint(pEnum, eRender, eConsole, &pRenDev);
+    if (FAILED(hr)) {
         snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                 "Cannot open capture filter");
+                 "No render device (0x%08lX)", hr);
+        pCapDev->lpVtbl->Release(pCapDev);
+        pEnum->lpVtbl->Release(pEnum);
         return ASIOFalse;
     }
 
-    drv->hRenderFilter = CreateFileW(
-        drv->renderFilterPath,
-        GENERIC_READ | GENERIC_WRITE,
-        0, NULL, OPEN_EXISTING, 0, NULL
-    );
-    if (drv->hRenderFilter == INVALID_HANDLE_VALUE) {
-        drv->hRenderFilter = NULL;
+    pEnum->lpVtbl->Release(pEnum);
+    pEnum = NULL;
+
+    /* Log device IDs */
+    {
+        LPWSTR capId = NULL, renId = NULL;
+        if (SUCCEEDED(pCapDev->lpVtbl->GetId(pCapDev, &capId))) {
+            fprintf(stderr, "  Capture device: %ls\n", capId);
+            CoTaskMemFree(capId);
+        }
+        if (SUCCEEDED(pRenDev->lpVtbl->GetId(pRenDev, &renId))) {
+            fprintf(stderr, "  Render device:  %ls\n", renId);
+            CoTaskMemFree(renId);
+        }
+    }
+
+    /* Build our format descriptor */
+    BuildWaveFormat(&wfx, drv->currentRate);
+
+    /* Create event handles */
+    drv->hCaptureEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    drv->hRenderEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!drv->hCaptureEvent || !drv->hRenderEvent) {
         snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                 "Cannot open render filter");
+                 "Cannot create event handles");
+        pCapDev->lpVtbl->Release(pCapDev);
+        pRenDev->lpVtbl->Release(pRenDev);
         return ASIOFalse;
     }
 
-    /* Create WaveRT KS pins */
-    drv->hCapturePin = CreateWaveRtPin(drv->hCaptureFilter, 0, TRUE);
-    if (!drv->hCapturePin) {
+    /* Initialize capture client */
+    hr = InitWasapiClient(pCapDev, &wfx, &drv->pCapAudioClient,
+                          drv->hCaptureEvent, &drv->captureFrames, "capture");
+    pCapDev->lpVtbl->Release(pCapDev);
+    if (FAILED(hr)) {
         snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                 "Cannot create capture pin (another app using exclusive mode?)");
+                 "Capture init failed (0x%08lX)", hr);
+        pRenDev->lpVtbl->Release(pRenDev);
         return ASIOFalse;
     }
 
-    drv->hRenderPin = CreateWaveRtPin(drv->hRenderFilter, 0, FALSE);
-    if (!drv->hRenderPin) {
+    /* Initialize render client */
+    hr = InitWasapiClient(pRenDev, &wfx, &drv->pRenAudioClient,
+                          drv->hRenderEvent, &drv->renderFrames, "render");
+    pRenDev->lpVtbl->Release(pRenDev);
+    if (FAILED(hr)) {
         snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                 "Cannot create render pin (another app using exclusive mode?)");
+                 "Render init failed (0x%08lX)", hr);
+        drv->pCapAudioClient->lpVtbl->Release(drv->pCapAudioClient);
+        drv->pCapAudioClient = NULL;
         return ASIOFalse;
     }
 
-    /* Allocate DMA buffers via kernel bridge */
-    ULONG requestedSize = HDA_PREFERRED_FRAMES * HDA_BLOCK_ALIGN * 2;  /* Double buffer */
-
-    if (!BridgeAllocBuffer(drv->hBridge, drv->hCapturePin, requestedSize,
-                           &drv->captureBuffer, &drv->captureBufferSize)) {
-        snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                 "Cannot allocate capture DMA buffer (bridge error %lu)", GetLastError());
-        return ASIOFalse;
-    }
-
-    if (!BridgeAllocBuffer(drv->hBridge, drv->hRenderPin, requestedSize,
-                           &drv->renderBuffer, &drv->renderBufferSize)) {
-        snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                 "Cannot allocate render DMA buffer (bridge error %lu)", GetLastError());
-        return ASIOFalse;
-    }
-
-    /* Map position registers (optional -- may fail on some hardware) */
-    drv->capturePosition = BridgeMapPosition(drv->hBridge, drv->hCapturePin);
-    drv->renderPosition = BridgeMapPosition(drv->hBridge, drv->hRenderPin);
+    fprintf(stderr, "  WASAPI exclusive mode initialized @ %u Hz\n", drv->currentRate);
+    fprintf(stderr, "  Capture: %u frames (%.2fms)\n",
+            drv->captureFrames,
+            (double)drv->captureFrames / drv->currentRate * 1000.0);
+    fprintf(stderr, "  Render:  %u frames (%.2fms)\n",
+            drv->renderFrames,
+            (double)drv->renderFrames / drv->currentRate * 1000.0);
 
     drv->initialized = TRUE;
     return ASIOTrue;
@@ -575,7 +567,7 @@ static long STDMETHODCALLTYPE
 Asio_getDriverVersion(IASIO *This)
 {
     (void)This;
-    return 1;
+    return 2;
 }
 
 static void STDMETHODCALLTYPE
@@ -589,42 +581,88 @@ static ASIOError STDMETHODCALLTYPE
 Asio_start(IASIO *This)
 {
     HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)This;
+    HRESULT hr;
 
     if (!drv->buffersCreated) return ASE_InvalidMode;
     if (drv->running) return ASE_OK;
 
-    /* Transition pins: STOP -> ACQUIRE -> PAUSE -> RUN */
-    HANDLE pins[] = { drv->hCapturePin, drv->hRenderPin };
-    ULONG states[] = { HDA_PIN_STATE_ACQUIRE, HDA_PIN_STATE_PAUSE, HDA_PIN_STATE_RUN };
-    int p, s;
-
-    for (s = 0; s < 3; s++) {
-        for (p = 0; p < 2; p++) {
-            if (!BridgeSetPinState(drv->hBridge, pins[p], states[s])) {
-                snprintf(drv->errorMessage, sizeof(drv->errorMessage),
-                         "Pin state transition to %lu failed for %s",
-                         states[s], p == 0 ? "capture" : "render");
-                /* Try to roll back */
-                BridgeSetPinState(drv->hBridge, drv->hCapturePin, HDA_PIN_STATE_STOP);
-                BridgeSetPinState(drv->hBridge, drv->hRenderPin, HDA_PIN_STATE_STOP);
-                return ASE_HWMalfunction;
-            }
-        }
-    }
-
-    /* Start streaming thread */
-    drv->hStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    drv->currentBufferIndex = 0;
-    drv->hThread = CreateThread(NULL, 0, StreamingThread, drv, 0, NULL);
-    if (!drv->hThread) {
-        BridgeSetPinState(drv->hBridge, drv->hCapturePin, HDA_PIN_STATE_STOP);
-        BridgeSetPinState(drv->hBridge, drv->hRenderPin, HDA_PIN_STATE_STOP);
-        CloseHandle(drv->hStopEvent);
+    /* Get streaming sub-clients */
+    hr = drv->pCapAudioClient->lpVtbl->GetService(drv->pCapAudioClient,
+        &local_IID_IAudioCaptureClient, (void **)&drv->pCapClient);
+    if (FAILED(hr)) {
+        snprintf(drv->errorMessage, sizeof(drv->errorMessage),
+                 "Cannot get capture service (0x%08lX)", hr);
         return ASE_HWMalfunction;
     }
 
+    hr = drv->pRenAudioClient->lpVtbl->GetService(drv->pRenAudioClient,
+        &local_IID_IAudioRenderClient, (void **)&drv->pRenClient);
+    if (FAILED(hr)) {
+        snprintf(drv->errorMessage, sizeof(drv->errorMessage),
+                 "Cannot get render service (0x%08lX)", hr);
+        drv->pCapClient->lpVtbl->Release(drv->pCapClient);
+        drv->pCapClient = NULL;
+        return ASE_HWMalfunction;
+    }
+
+    /* Pre-fill render buffer with silence */
+    {
+        BYTE *pSilence = NULL;
+        hr = drv->pRenClient->lpVtbl->GetBuffer(drv->pRenClient,
+            drv->renderFrames, &pSilence);
+        if (SUCCEEDED(hr)) {
+            ZeroMemory(pSilence, drv->renderFrames * HDA_BLOCK_ALIGN);
+            drv->pRenClient->lpVtbl->ReleaseBuffer(drv->pRenClient,
+                drv->renderFrames, AUDCLNT_BUFFERFLAGS_SILENT);
+        }
+    }
+
+    /* Create stop event and streaming thread */
+    drv->hStopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    drv->currentBufferIndex = 0;
+    drv->samplePosition = 0;
+
+    drv->hThread = CreateThread(NULL, 0, StreamingThread, drv, 0, NULL);
+    if (!drv->hThread) {
+        snprintf(drv->errorMessage, sizeof(drv->errorMessage),
+                 "Cannot create streaming thread");
+        drv->pCapClient->lpVtbl->Release(drv->pCapClient); drv->pCapClient = NULL;
+        drv->pRenClient->lpVtbl->Release(drv->pRenClient); drv->pRenClient = NULL;
+        CloseHandle(drv->hStopEvent); drv->hStopEvent = NULL;
+        return ASE_HWMalfunction;
+    }
+
+    /* Start render first (has pre-filled silence), then capture */
+    hr = drv->pRenAudioClient->lpVtbl->Start(drv->pRenAudioClient);
+    if (FAILED(hr)) {
+        snprintf(drv->errorMessage, sizeof(drv->errorMessage),
+                 "Render start failed (0x%08lX)", hr);
+        goto start_fail;
+    }
+
+    hr = drv->pCapAudioClient->lpVtbl->Start(drv->pCapAudioClient);
+    if (FAILED(hr)) {
+        drv->pRenAudioClient->lpVtbl->Stop(drv->pRenAudioClient);
+        snprintf(drv->errorMessage, sizeof(drv->errorMessage),
+                 "Capture start failed (0x%08lX)", hr);
+        goto start_fail;
+    }
+
     drv->running = TRUE;
+    fprintf(stderr, "  ASIO started (WASAPI exclusive, %u frames, %.2fms @ %uHz)\n",
+            drv->captureFrames,
+            (double)drv->captureFrames / drv->currentRate * 1000.0,
+            drv->currentRate);
     return ASE_OK;
+
+start_fail:
+    SetEvent(drv->hStopEvent);
+    WaitForSingleObject(drv->hThread, 5000);
+    CloseHandle(drv->hThread); drv->hThread = NULL;
+    CloseHandle(drv->hStopEvent); drv->hStopEvent = NULL;
+    drv->pCapClient->lpVtbl->Release(drv->pCapClient); drv->pCapClient = NULL;
+    drv->pRenClient->lpVtbl->Release(drv->pRenClient); drv->pRenClient = NULL;
+    return ASE_HWMalfunction;
 }
 
 static ASIOError STDMETHODCALLTYPE
@@ -634,7 +672,7 @@ Asio_stop(IASIO *This)
 
     if (!drv->running) return ASE_OK;
 
-    /* Signal thread to stop */
+    /* Signal thread to stop and wait */
     SetEvent(drv->hStopEvent);
     WaitForSingleObject(drv->hThread, 5000);
     CloseHandle(drv->hThread);
@@ -642,15 +680,16 @@ Asio_stop(IASIO *This)
     drv->hThread = NULL;
     drv->hStopEvent = NULL;
 
-    /* Transition pins back to STOP */
-    BridgeSetPinState(drv->hBridge, drv->hCapturePin, HDA_PIN_STATE_PAUSE);
-    BridgeSetPinState(drv->hBridge, drv->hRenderPin, HDA_PIN_STATE_PAUSE);
-    BridgeSetPinState(drv->hBridge, drv->hCapturePin, HDA_PIN_STATE_ACQUIRE);
-    BridgeSetPinState(drv->hBridge, drv->hRenderPin, HDA_PIN_STATE_ACQUIRE);
-    BridgeSetPinState(drv->hBridge, drv->hCapturePin, HDA_PIN_STATE_STOP);
-    BridgeSetPinState(drv->hBridge, drv->hRenderPin, HDA_PIN_STATE_STOP);
+    /* Stop both audio clients */
+    if (drv->pCapAudioClient) drv->pCapAudioClient->lpVtbl->Stop(drv->pCapAudioClient);
+    if (drv->pRenAudioClient) drv->pRenAudioClient->lpVtbl->Stop(drv->pRenAudioClient);
+
+    /* Release streaming sub-clients */
+    if (drv->pCapClient) { drv->pCapClient->lpVtbl->Release(drv->pCapClient); drv->pCapClient = NULL; }
+    if (drv->pRenClient) { drv->pRenClient->lpVtbl->Release(drv->pRenClient); drv->pRenClient = NULL; }
 
     drv->running = FALSE;
+    fprintf(stderr, "  ASIO stopped\n");
     return ASE_OK;
 }
 
@@ -667,9 +706,9 @@ static ASIOError STDMETHODCALLTYPE
 Asio_getLatencies(IASIO *This, long *inputLatency, long *outputLatency)
 {
     HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)This;
-    /* Our latency is exactly one buffer period (3.33ms for 160 frames) */
-    *inputLatency = drv->bufferSize > 0 ? drv->bufferSize : HDA_PREFERRED_FRAMES;
-    *outputLatency = drv->bufferSize > 0 ? drv->bufferSize : HDA_PREFERRED_FRAMES;
+    long frames = (drv->captureFrames > 0) ? (long)drv->captureFrames : HDA_PREFERRED_FRAMES;
+    *inputLatency = frames;
+    *outputLatency = frames;
     return ASE_OK;
 }
 
@@ -677,29 +716,65 @@ static ASIOError STDMETHODCALLTYPE
 Asio_getBufferSize(IASIO *This, long *minSize, long *maxSize,
                    long *preferredSize, long *granularity)
 {
-    (void)This;
-    /* Hardcoded to HDA codec's aligned buffer size */
-    *minSize = HDA_PREFERRED_FRAMES;
-    *maxSize = HDA_PREFERRED_FRAMES * 4;    /* Up to ~13ms */
-    *preferredSize = HDA_PREFERRED_FRAMES;  /* 160 frames = 3.33ms */
-    *granularity = HDA_PREFERRED_FRAMES;    /* Must be multiples of 160 */
+    HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)This;
+    long frames = (drv->captureFrames > 0) ? (long)drv->captureFrames : HDA_PREFERRED_FRAMES;
+    /* Fixed buffer size in WASAPI exclusive mode */
+    *minSize = frames;
+    *maxSize = frames;
+    *preferredSize = frames;
+    *granularity = 0;
     return ASE_OK;
+}
+
+static ASIOError STDMETHODCALLTYPE
+Asio_canSampleRate(IASIO *This, ASIOSampleRate rate)
+{
+    (void)This;
+    UINT32 r = (UINT32)rate;
+    if (r == 44100 || r == 48000) return ASE_OK;
+    return ASE_NoClock;
 }
 
 static ASIOError STDMETHODCALLTYPE
 Asio_getSampleRate(IASIO *This, ASIOSampleRate *rate)
 {
-    (void)This;
-    *rate = (ASIOSampleRate)HDA_SAMPLE_RATE;
+    HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)This;
+    *rate = (ASIOSampleRate)(drv->currentRate ? drv->currentRate : HDA_SAMPLE_RATE);
     return ASE_OK;
 }
 
 static ASIOError STDMETHODCALLTYPE
 Asio_setSampleRate(IASIO *This, ASIOSampleRate rate)
 {
-    (void)This;
-    /* We only support 48kHz -- the codec's native rate */
-    if ((long)rate != HDA_SAMPLE_RATE) return ASE_NoClock;
+    HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)This;
+    UINT32 newRate = (UINT32)rate;
+
+    if (newRate != 44100 && newRate != 48000) return ASE_NoClock;
+    if (newRate == drv->currentRate) return ASE_OK;
+
+    /* Tear down current WASAPI state for re-init at new rate */
+    if (drv->running) Asio_stop(This);
+    if (drv->buffersCreated) Asio_disposeBuffers(This);
+
+    if (drv->pCapAudioClient) {
+        drv->pCapAudioClient->lpVtbl->Release(drv->pCapAudioClient);
+        drv->pCapAudioClient = NULL;
+    }
+    if (drv->pRenAudioClient) {
+        drv->pRenAudioClient->lpVtbl->Release(drv->pRenAudioClient);
+        drv->pRenAudioClient = NULL;
+    }
+    if (drv->hCaptureEvent) { CloseHandle(drv->hCaptureEvent); drv->hCaptureEvent = NULL; }
+    if (drv->hRenderEvent)  { CloseHandle(drv->hRenderEvent);  drv->hRenderEvent = NULL; }
+
+    drv->currentRate = newRate;
+    drv->initialized = FALSE;
+
+    fprintf(stderr, "  setSampleRate: switching to %u Hz\n", newRate);
+
+    /* Re-initialize WASAPI with new rate */
+    if (!Asio_init(This, drv->sysHandle)) return ASE_HWMalfunction;
+
     return ASE_OK;
 }
 
@@ -730,16 +805,10 @@ Asio_getSamplePosition(IASIO *This, ASIOSamples *sPos, ASIOTimeStamp *tStamp)
     HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)This;
     LARGE_INTEGER pc, freq;
 
-    if (drv->capturePosition) {
-        ULONG bytePos = *(drv->capturePosition);
-        *sPos = (ASIOSamples)(bytePos / HDA_BLOCK_ALIGN);
-    } else {
-        *sPos = 0;
-    }
+    *sPos = (ASIOSamples)drv->samplePosition;
 
     QueryPerformanceCounter(&pc);
     QueryPerformanceFrequency(&freq);
-    /* Convert to nanoseconds */
     *tStamp = (ASIOTimeStamp)((pc.QuadPart * 1000000000LL) / freq.QuadPart);
 
     return ASE_OK;
@@ -772,6 +841,7 @@ Asio_createBuffers(IASIO *This, ASIOBufferInfo *bufferInfos, long numChannels,
 {
     HDA_ASIO_DRIVER *drv = (HDA_ASIO_DRIVER *)This;
     long i;
+    ULONG bufBytes;
 
     if (!drv->initialized) return ASE_NotPresent;
     if (drv->buffersCreated) Asio_disposeBuffers(This);
@@ -780,41 +850,42 @@ Asio_createBuffers(IASIO *This, ASIOBufferInfo *bufferInfos, long numChannels,
     drv->callbacks = callbacks;
 
     /*
-     * ASIO double-buffering maps onto the DMA buffer:
-     *   DMA buffer = [half 0][half 1]
-     *   Each half = bufferSize frames of interleaved stereo
-     *
-     * For deinterleaved ASIO channels, we point directly into the
-     * interleaved DMA buffer. The host/DAW handles interleaving.
-     *
-     * NOTE: For 16-bit stereo interleaved, the ASIO buffer pointers
-     * point to the raw interleaved data. The host expects per-channel
-     * buffers, so for full correctness we'd need deinterleaving.
-     * For our proof-of-concept, we provide the raw interleaved buffer
-     * and report 1 stereo pair per direction.
-     *
-     * A production driver would deinterleave in the callback thread.
+     * Allocate per-channel non-interleaved double buffers.
+     * ASIO expects each channel to have its own contiguous buffer of
+     * mono samples: [S0, S1, S2, ...] with stride = sizeof(sample).
+     * WASAPI provides/expects interleaved stereo, so we deinterleave
+     * on capture and reinterleave on render in the streaming thread.
      */
-    ULONG halfBytes = bufferSize * HDA_BLOCK_ALIGN;
+    bufBytes = bufferSize * (HDA_BITS_PER_SAMPLE / 8);  /* per-channel size in bytes */
 
+    {
+        int ch;
+        for (ch = 0; ch < HDA_NUM_CHANNELS; ch++) {
+            drv->capCh[ch][0] = VirtualAlloc(NULL, bufBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            drv->capCh[ch][1] = VirtualAlloc(NULL, bufBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            drv->renCh[ch][0] = VirtualAlloc(NULL, bufBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            drv->renCh[ch][1] = VirtualAlloc(NULL, bufBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (!drv->capCh[ch][0] || !drv->capCh[ch][1] ||
+                !drv->renCh[ch][0] || !drv->renCh[ch][1]) {
+                snprintf(drv->errorMessage, sizeof(drv->errorMessage),
+                         "Cannot allocate ASIO buffers");
+                return ASE_NoMemory;
+            }
+        }
+    }
+
+    /* Point ASIO buffer pointers to per-channel non-interleaved buffers */
     for (i = 0; i < numChannels; i++) {
+        long ch = bufferInfos[i].channelIndex;
+
         if (bufferInfos[i].isInput) {
-            long ch = bufferInfos[i].channelIndex;
-            /* Point to the channel's data within each half of capture DMA buffer */
-            BYTE *base = (BYTE *)drv->captureBuffer;
-            /* Channel offset: ch * bytesPerSample within each frame */
-            ULONG chOffset = ch * (HDA_BITS_PER_SAMPLE / 8);
-            bufferInfos[i].buffers[0] = base + chOffset;
-            bufferInfos[i].buffers[1] = base + halfBytes + chOffset;
+            bufferInfos[i].buffers[0] = drv->capCh[ch][0];
+            bufferInfos[i].buffers[1] = drv->capCh[ch][1];
         } else {
-            long ch = bufferInfos[i].channelIndex;
-            BYTE *base = (BYTE *)drv->renderBuffer;
-            ULONG chOffset = ch * (HDA_BITS_PER_SAMPLE / 8);
-            bufferInfos[i].buffers[0] = base + chOffset;
-            bufferInfos[i].buffers[1] = base + halfBytes + chOffset;
+            bufferInfos[i].buffers[0] = drv->renCh[ch][0];
+            bufferInfos[i].buffers[1] = drv->renCh[ch][1];
         }
 
-        /* Store in our tracking array */
         if (i < 4) {
             drv->asioBuffers[0][i] = bufferInfos[i].buffers[0];
             drv->asioBuffers[1][i] = bufferInfos[i].buffers[1];
@@ -832,19 +903,18 @@ Asio_disposeBuffers(IASIO *This)
 
     if (drv->running) Asio_stop(This);
 
-    /* Free DMA buffers via bridge */
-    if (drv->hBridge) {
-        if (drv->hCapturePin) BridgeFreeBuffer(drv->hBridge, drv->hCapturePin);
-        if (drv->hRenderPin) BridgeFreeBuffer(drv->hBridge, drv->hRenderPin);
+    {
+        int ch;
+        for (ch = 0; ch < HDA_NUM_CHANNELS; ch++) {
+            if (drv->capCh[ch][0]) { VirtualFree(drv->capCh[ch][0], 0, MEM_RELEASE); drv->capCh[ch][0] = NULL; }
+            if (drv->capCh[ch][1]) { VirtualFree(drv->capCh[ch][1], 0, MEM_RELEASE); drv->capCh[ch][1] = NULL; }
+            if (drv->renCh[ch][0]) { VirtualFree(drv->renCh[ch][0], 0, MEM_RELEASE); drv->renCh[ch][0] = NULL; }
+            if (drv->renCh[ch][1]) { VirtualFree(drv->renCh[ch][1], 0, MEM_RELEASE); drv->renCh[ch][1] = NULL; }
+        }
     }
 
-    drv->captureBuffer = NULL;
-    drv->renderBuffer = NULL;
-    drv->capturePosition = NULL;
-    drv->renderPosition = NULL;
     drv->buffersCreated = FALSE;
     drv->callbacks = NULL;
-
     ZeroMemory(drv->asioBuffers, sizeof(drv->asioBuffers));
     return ASE_OK;
 }
@@ -855,12 +925,13 @@ Asio_controlPanel(IASIO *This)
     (void)This;
     MessageBoxW(NULL,
         L"HDA Direct ASIO\n\n"
-        L"Custom kernel-mode ASIO driver for Conexant CX20753/4\n"
-        L"on Intel HDA bus.\n\n"
-        L"Fixed configuration:\n"
-        L"  48000 Hz / 16-bit / Stereo\n"
-        L"  160 frames (3.33ms) per buffer\n\n"
-        L"signal-chain experiment",
+        L"WASAPI Exclusive Mode ASIO driver\n"
+        L"for Conexant CX20753/4 on Intel HDA bus.\n\n"
+        L"Configuration:\n"
+        L"  44100 / 48000 Hz / 16-bit / Stereo\n"
+        L"  Event-driven exclusive mode\n\n"
+        L"signal-chain experiment\n"
+        L"github.com/ELI7VH/signal-chain",
         L"HDA Direct ASIO",
         MB_OK | MB_ICONINFORMATION);
     return ASE_OK;
@@ -886,8 +957,11 @@ static ASIOError STDMETHODCALLTYPE
 Asio_outputReady(IASIO *This)
 {
     (void)This;
-    /* We support outputReady -- the host should call this after filling buffers */
-    return ASE_OK;
+    /* Return ASE_NotPresent -- we don't support the outputReady optimization.
+     * Our streaming thread pushes render data on its own schedule.
+     * Returning ASE_OK here lies to the host about timing, which causes
+     * DAWs like Studio One to report 100% CPU usage. */
+    return ASE_NotPresent;
 }
 
 /* ---- COM Class Factory ---- */
@@ -941,6 +1015,7 @@ CF_CreateInstance(IClassFactory *This, IUnknown *pUnk, REFIID riid, void **ppv)
 
     drv->lpVtbl = &g_AsioVtbl;
     drv->refCount = 1;
+    drv->currentRate = HDA_SAMPLE_RATE;  /* default 48kHz */
     InterlockedIncrement(&g_dllRefCount);
 
     *ppv = (void *)drv;
@@ -1024,8 +1099,8 @@ HRESULT WINAPI DllRegisterServer(void)
                    (BYTE *)HDA_ASIO_CLSID_STR,
                    (DWORD)strlen(HDA_ASIO_CLSID_STR) + 1);
     RegSetValueExA(hKey, "Description", 0, REG_SZ,
-                   (BYTE *)"Direct HDA ASIO - signal-chain",
-                   31);
+                   (BYTE *)"Direct HDA ASIO - WASAPI exclusive",
+                   35);
     RegCloseKey(hKey);
 
     return S_OK;

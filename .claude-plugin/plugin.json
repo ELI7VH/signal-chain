@@ -1,7 +1,7 @@
 {
   "name": "signal-chain",
-  "version": "0.1.0",
-  "description": "AI-generated custom audio orchestration for known hardware configurations. Snapshot your hardware, generate optimal ALSA/ASIO/CoreAudio configs, eliminate the abstraction tax. 3 agents, 2 commands, 1 skill.",
+  "version": "0.2.0",
+  "description": "AI-generated custom audio orchestration for known hardware configurations. Snapshot your hardware, generate optimal ALSA/ASIO/CoreAudio configs, build purpose-built drivers, eliminate the abstraction tax. Proven: custom ASIO driver for Conexant HDA codec at 6.67ms round-trip.",
   "author": {
     "name": "Elijah Lucian",
     "url": "https://elijahlucian.ca"
@@ -13,6 +13,7 @@
     "audio",
     "alsa",
     "asio",
+    "wasapi",
     "coreaudio",
     "drivers",
     "hardware",
@@ -21,6 +22,9 @@
     "usb-audio",
     "midi",
     "raspberry-pi",
-    "orchestration"
+    "orchestration",
+    "dma",
+    "hda",
+    "kernel-streaming"
   ]
 }

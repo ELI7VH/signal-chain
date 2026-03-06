@@ -154,6 +154,7 @@ typedef struct IASIOVtbl {
     ASIOError (STDMETHODCALLTYPE *getChannels)(IASIO *This, long *numInputChannels, long *numOutputChannels);
     ASIOError (STDMETHODCALLTYPE *getLatencies)(IASIO *This, long *inputLatency, long *outputLatency);
     ASIOError (STDMETHODCALLTYPE *getBufferSize)(IASIO *This, long *minSize, long *maxSize, long *preferredSize, long *granularity);
+    ASIOError (STDMETHODCALLTYPE *canSampleRate)(IASIO *This, ASIOSampleRate sampleRate);
     ASIOError (STDMETHODCALLTYPE *getSampleRate)(IASIO *This, ASIOSampleRate *sampleRate);
     ASIOError (STDMETHODCALLTYPE *setSampleRate)(IASIO *This, ASIOSampleRate sampleRate);
     ASIOError (STDMETHODCALLTYPE *getClockSources)(IASIO *This, ASIOClockSource *clocks, long *numSources);
